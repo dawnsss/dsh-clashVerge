@@ -6,9 +6,47 @@
  * Run: node tests/client.mjs
  */
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
 import { createRequire } from 'node:module'
+import os from 'node:os'
+import path from 'node:path'
 
-const profileRequire = createRequire('C:/Users/Laptop/.dsh/profiles/web/noop.cjs')
+/**
+ * Locate a React to render with. The bundle ships no copy of its own — it borrows the host's — so
+ * the test needs a DSH profile that has one installed. `DSH_PROFILE_DIR` wins; otherwise every
+ * profile under `~/.dsh/profiles` is tried in turn.
+ * @returns a `require` rooted in that profile, or undefined when there is no such profile.
+ */
+function resolveProfileRequire() {
+  const candidates = []
+  if (process.env.DSH_PROFILE_DIR) candidates.push(path.resolve(process.env.DSH_PROFILE_DIR))
+  try {
+    const root = path.join(os.homedir(), '.dsh', 'profiles')
+    for (const name of fs.readdirSync(root)) candidates.push(path.join(root, name))
+  } catch {
+    // No profiles yet: the skip below says what to do about it.
+  }
+  for (const dir of candidates) {
+    // Resolve rather than stat a path: pnpm hoists react to a shared node_modules above the
+    // profile, so `dir/node_modules/react` usually does not exist even when requiring it works.
+    const require = createRequire(path.join(dir, 'noop.cjs'))
+    try {
+      require.resolve('react')
+      require.resolve('react-dom/server')
+      return require
+    } catch {
+      // This profile has no renderer; try the next one.
+    }
+  }
+  return undefined
+}
+
+const profileRequire = resolveProfileRequire()
+if (profileRequire === undefined) {
+  console.log('skip  no DSH profile with react found (set DSH_PROFILE_DIR, or install the plugin into a profile)')
+  process.exit(0)
+}
+
 const React = profileRequire('react')
 const { renderToStaticMarkup } = profileRequire('react-dom/server')
 

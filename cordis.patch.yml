@@ -2,7 +2,7 @@
 #
 # One row: the plugin's Node half. Installing the package through the profile
 #
-#   dsh plugin --profile web add D:\work\2026\ai\custom-plugin\dsh-clashVerge
+#   dsh plugin --profile web add github:dawnsss/dsh-clashVerge
 #
 # reconciles `dsh.profile.bundles` and merges this insert at boot, so no profile
 # file needs to be edited by hand. If the profile's own cordis.patch.yml already

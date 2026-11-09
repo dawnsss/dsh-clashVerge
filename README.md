@@ -97,10 +97,26 @@ DSH 进程 ──fetch/子进程──▶ 127.0.0.1:<临时端口> 本地统计�
 ## 安装
 
 ```bash
-dsh plugin --profile web add D:\work\2026\ai\custom-plugin\dsh-clashVerge
+# 直接装 GitHub 上的仓库
+dsh plugin --profile web add github:dawnsss/dsh-clashVerge
+
+# 或者先克隆，再装本地目录（改完 lib/*.js 立刻生效，适合自己动代码）
+git clone https://github.com/dawnsss/dsh-clashVerge.git
+dsh plugin --profile web add ./dsh-clashVerge
 ```
 
 或在 GUI 插件页用「本地目录」安装。装完刷新页面，左侧栏出现「出口模式」。
+
+## 测试
+
+```bash
+node tests/smoke.mjs    # 代理路由、CONNECT 隧道、降级与计数
+node tests/host.mjs     # host 半契约：14 项（需要本机装着 DSH，读它 profile 里的依赖）
+node tests/client.mjs   # bundle 契约；找不到含 react 的 profile 时自动跳过
+node tests/bench.mjs    # 回环性能取样，可选，默认 64 MiB × 3 轮
+```
+
+`smoke` 与 `bench` 自己起 origin 与上游替身，不联网；`host` 会在 `~/.dsh/storages/clash-verge/` 下写状态文件，跑完自行清理。
 
 ## 结构
 
