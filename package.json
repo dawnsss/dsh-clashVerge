@@ -1,7 +1,7 @@
 {
   "name": "dsh-clash-verge",
   "version": "0.1.0",
-  "description": "Clash Verge 风格的出口模式面板：为 DSH 自身出网预制「不接管 / 直连 / 外网 / 全局」四种模式，经本地统计代理出网并出流量报表 · Egress mode presets and traffic report for DSH",
+  "description": "管理 DSH 自己的出网：四种模式决定每个请求走哪条链路，内嵌本地代理按字节记账 · Egress control and byte-level traffic accounting for DSH",
   "license": "MIT",
   "private": true,
   "repository": {
