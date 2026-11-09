@@ -19,7 +19,7 @@ DSH 向外发的每一个请求，都从这条链路出去：`web_fetch`、`web_
 - **按请求记账，不只按连接。** 报表以目标主机为维度聚合，回答「这次调研吃了多少流量、都去了哪台主机」；系统级代理只看得到连接，看不到是谁发起的。
 - **切换不用重启，也不打断在跑的任务。** 模式是运行期状态，换链路只影响之后的请求，正在下载的文件保持原路由。
 - **模型可以自己切。** `egress_mode` 工具让 agent 把「先切全局 → 打内网 → 切回外网」写成流程，不需要人守在面板前点。
-- **上游故障自动降级。** 每 15 秒探活，不可达就直连并记账，一次代理故障不会升级成一次会话事故。
+- **上游故障不升级成会话事故。** 每 15 秒探活：`external` 不可达时降级直连并记账；`global` 默认**失败关闭**（拒绝发送、记 `blocked`），因为一次悄悄直连正是这个预设要防的泄露。两种行为都可在面板里看到、在配置里改。
 - **不接管系统网络。** 不改系统代理、不开 TUN、不动网卡与防火墙；插件不在了，网络立刻回到启动时的样子，不会留下一个把整机留在断网状态的残留配置。
 - **流式透传，不做中间加工。** 连接直接 pipe，不缓冲、不重写报文、不注入头部，本地代理只负责选路和计数。
 - **零依赖、无构建。** host 半是原生 ESM，客户端半是手写 bundle，改完 `lib/*.js` 直接生效，没有 `npm install`，也没有打包步骤。
@@ -48,7 +48,8 @@ DSH 进程 ──fetch/子进程──▶ 127.0.0.1:<临时端口> 本地统计�
 - 每个连接按**目标主机名**决定路由，而不是按进程：`external` 用私网判定（10/8、172.16/12、192.168/16、169.254/16、100.64/10、fc00::/7、`.local`/`.lan`/`.internal` 等后缀、单标签主机名）决定直连还是上游。
 - 回环永远直连 —— 否则 Web UI 自己的请求会被代理绕回自己，形成环路。
 - 策略通过 `@deepseek-ai/dsh-http-proxy` 安装：进程内的 `fetch` 换掉 undici 全局 dispatcher，子进程在 spawn 时读到 `http_proxy/https_proxy`，所以**切换只影响之后的请求**，正在跑的下载保持原路由。
-- 上游健康每 15 秒探测一次；上游不可达时自动降级直连并在面板上记一条「降级直连 N 次」，避免一次代理故障把整个会话的网络一起拖死。
+- 上游健康每 15 秒探测一次。不可达时按模式处理：`external` 降级直连（面板记「降级直连 N 次」），`global` 默认 **失败关闭** —— 请求不被发送、返回 502、报表记在 `blocked` 而不是 `direct`，可用 `globalFailClosed: false` 关掉改成降级。
+- 目标地址在建连前先校验：端口超出 1–65535 或主机名为空直接 400 拒绝，不会让一个畸形 `CONNECT` 把进程带走。
 
 上游地址默认自动探测：读到本机 `verge.yaml` 的 `verge_mixed_port` 就用它（常见 7897），读不到就用 7897；面板里可改成任意 `host:port` / `http(s)://host:port`。
 
@@ -90,9 +91,17 @@ DSH 进程 ──fetch/子进程──▶ 127.0.0.1:<临时端口> 本地统计�
 | --- | --- | --- |
 | GET | `/state` | 当前模式、上游、代理状态、完整报表 |
 | POST | `/mode` | `{ "mode": "off" \| "direct" \| "external" \| "global" }` |
-| POST | `/config` | `{ upstream?, bypass?, intranetSuffixes? }` |
+| POST | `/config` | `{ upstream?, bypass?, intranetSuffixes?, globalFailClosed? }`（`upstream` 非法值返回 400 且不覆盖已存配置） |
 | POST | `/probe` | 立即探测上游 |
 | POST | `/reset` | 清零统计 |
+
+## 安全边界
+
+这个接口能改出口链路，所以它自己守门，不依赖上层：
+
+- 只接受**同源**请求：`Sec-Fetch-Site` 必须是 `same-origin`/`none`，`Origin`（若有）必须等于 `Host`，`Host` 必须是回环地址或在白名单里（挡 DNS rebinding）。跨站页面发来的表单/简单请求一律 403 —— 它们既拿不到响应，也改不了模式。
+- 写操作必须是 `application/json`（否则 415）并带上本进程当次启动生成的 `x-clash-verge-token`（否则 403）。token 由 `GET /state` 下发，跨源页面读不到响应，因此拿不到它；面板刷新后自动换新。
+- 通过反向代理访问 Web UI 时，把对外的 `Host` 加进 `CLASH_VERGE_TRUSTED_HOSTS`（逗号分隔）即可，否则这些写操作会被判成不可信来源。
 
 ## 安装
 
@@ -111,7 +120,7 @@ dsh plugin --profile web add ./dsh-clashVerge
 
 ```bash
 node tests/smoke.mjs    # 代理路由、CONNECT 隧道、降级与计数
-node tests/host.mjs     # host 半契约：14 项（需要本机装着 DSH，读它 profile 里的依赖）
+node tests/host.mjs     # host 半契约：21 项（含鉴权、坏端口、失败关闭；需要本机装着 DSH，读它 profile 里的依赖）
 node tests/client.mjs   # bundle 契约；找不到含 react 的 profile 时自动跳过
 node tests/bench.mjs    # 回环性能取样，可选，默认 64 MiB × 3 轮
 ```
@@ -131,10 +140,13 @@ tests/client.mjs  bundle 契约：模块注册、槽位、图标与首屏渲染
 tests/bench.mjs   回环性能取样（小请求往返 / 批量吞吐 / CPU）
 ```
 
-Host 半是原生 ESM JS，客户端半是手写 CJS bundle，因此**没有构建步骤**，改完 `lib/*.js` 直接生效（面板 HMR 跟随 `lib/client.js` 的 mtime）。
+Host 半是原生 ESM JS，客户端半是手写 CJS bundle，因此**没有构建步骤**：
+
+- 改 `lib/client.js`：DSH 按 mtime/size 轮询 bundle，刷新都不用，面板在页内换新（`browser_*`/浏览器里直接可见）。
+- 改 `lib/index.js` 或 `lib/proxy.js`：host 半只在进程启动时加载，重启 `dsh web` 才生效。
 
 ## 注意
 
-- 只支持 HTTP/HTTPS 上游；SOCKS 上游会被 `dsh-http-proxy` 跳过。
+- 只支持 HTTP/HTTPS 上游：填 `socks5://…` 会被 400 拒绝（`dsh-http-proxy` 也只懂 HTTP 上游），免得把一个不会工作的地址存进去。
 - `external` 模式判定的是**主机名**，不做 DNS 解析后再判定 —— 一个公网域名解析到内网地址时仍会走上游，这是刻意的（否则每次请求都要多一次 DNS）。
 - 需要「连内网也走代理」时用 `global`，并把 `bypass` 留空。

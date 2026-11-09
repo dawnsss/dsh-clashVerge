@@ -11,7 +11,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { readFileSync, rmSync } from 'node:fs'
 
-const { apply, formatBytes, MODES } = await import('../lib/index.js')
+const { apply, formatBytes, inject, MODES } = await import('../lib/index.js')
 
 const stateFile = path.join(os.homedir(), '.dsh', 'storages', 'clash-verge', 'state.json')
 rmSync(stateFile, { force: true })
@@ -44,6 +44,13 @@ const ctx = {
       tool = definition
       return () => {}
     },
+  },
+  // `inject` is a hard requirement list, and `tools` is not on it: the plugin asks for the registry
+  // through the dynamic form instead, so that a profile without tools still gets the panel.
+  inject(dependencies, callback) {
+    assert.deepEqual(dependencies, ['tools'])
+    callback({ effect: ctx.effect, tools: ctx.tools, inject: ctx.inject })
+    return () => {}
   },
 }
 
@@ -82,6 +89,7 @@ assert.equal(route?.kind, 'prefix')
 assert.equal(route.path, '/clash-verge/api')
 assert.equal(tool?.name, 'egress_mode')
 assert.deepEqual(MODES.map((entry) => entry.id), ['off', 'direct', 'external', 'global'])
+assert.deepEqual(inject, ['webServer'], 'tools must not be a hard requirement: a profile without it would lose the panel')
 
 const bridge = http.createServer((req, res) => {
   route.handler(req, res).catch((error) => {
@@ -93,7 +101,12 @@ const bridgePort = await listen(bridge)
 
 // `node:http` rather than `fetch`: the plugin replaces the process-wide undici dispatcher, and a
 // pooled fetch socket would be torn down mid-response by the very switch it is asking for.
-const call = (action, body) => new Promise((resolve, reject) => {
+//
+// The token is what the panel echoes back: the host half mints one per process and refuses any
+// mutation that does not carry it, so a cross-site page (which cannot read a cross-origin response)
+// can never learn it.
+let apiToken = ''
+const call = (action, body, extraHeaders = {}) => new Promise((resolve, reject) => {
   const payload = body === undefined ? undefined : JSON.stringify(body)
   const request = http.request({
     host: '127.0.0.1',
@@ -105,18 +118,35 @@ const call = (action, body) => new Promise((resolve, reject) => {
       accept: 'application/json',
       connection: 'close',
       ...(payload === undefined ? {} : { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) }),
+      ...(payload === undefined || apiToken === '' ? {} : { 'x-clash-verge-token': apiToken }),
+      ...extraHeaders,
     },
   }, (response) => {
     const chunks = []
     response.on('data', (chunk) => chunks.push(chunk))
     response.on('end', () => {
       const text = Buffer.concat(chunks).toString('utf8')
-      resolve({ status: response.statusCode, payload: text === '' ? {} : JSON.parse(text) })
+      const parsed = text === '' ? {} : JSON.parse(text)
+      if (typeof parsed.token === 'string' && parsed.token !== '') apiToken = parsed.token
+      resolve({ status: response.statusCode, payload: parsed })
     })
   })
   request.on('error', reject)
   request.setTimeout(8000, () => request.destroy(new Error(`api ${action} timed out`)))
   request.end(payload)
+})
+
+/** A raw CONNECT, so an impossible authority reaches the proxy unchanged. */
+const connectTo = (proxyPort, authority) => new Promise((resolve) => {
+  const socket = net.connect(proxyPort, '127.0.0.1', () => {
+    socket.write(`CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`)
+  })
+  let text = ''
+  const finish = () => { socket.destroy(); resolve(text) }
+  socket.on('data', (chunk) => { text += chunk.toString('latin1') })
+  socket.on('close', finish)
+  socket.on('error', finish)
+  socket.setTimeout(4000, finish)
 })
 
 /** One request sent to the plugin's own proxy in absolute-URL form. */
@@ -261,6 +291,63 @@ await check('probe: reports the upstream again', async () => {
   const { payload } = await call('probe', {})
   assert.equal(payload.upstream.reachable, true)
   assert.ok(payload.upstream.checkedAt > 0)
+})
+
+await check('api: a cross-site POST cannot change the mode', async () => {
+  const before = (await call('state')).payload.mode
+  const { status } = await call('mode', { mode: 'global' }, {
+    origin: 'https://evil.example',
+    'sec-fetch-site': 'cross-site',
+    'content-type': 'text/plain',
+  })
+  assert.equal(status, 403, 'a cross-site simple request must be refused')
+  assert.equal((await call('state')).payload.mode, before)
+})
+
+await check('api: a same-origin POST with a wrong token is refused', async () => {
+  const { status } = await call('mode', { mode: 'direct' }, { 'x-clash-verge-token': 'not-the-panel-token' })
+  assert.equal(status, 403)
+})
+
+await check('api: a POST with a non-JSON content type is refused', async () => {
+  const { status } = await call('mode', { mode: 'direct' }, { 'content-type': 'text/plain' })
+  assert.equal(status, 415)
+})
+
+await check('proxy: an impossible CONNECT port is refused, and the process survives it', async () => {
+  const text = await connectTo(proxyPort, '127.0.0.1:99999')
+  assert.match(text, /^HTTP\/1\.1 400/, `expected a 400 for host:99999, got ${JSON.stringify(text.slice(0, 40))}`)
+  const alive = await call('state')
+  assert.equal(alive.status, 200, 'an out-of-range port must never become an uncaught exception')
+})
+
+await check('global: an unreachable upstream fails closed instead of going direct', async () => {
+  await call('config', { upstream: 'http://127.0.0.1:9' })
+  const { payload } = await call('mode', { mode: 'global' })
+  assert.equal(payload.upstream.reachable, false)
+  const answer = await through(proxyPort, 'http://blocked.example/x')
+  assert.equal(answer.status, 502, 'global must not answer a request it could not route through the upstream')
+  assert.match(answer.body, /was not sent/)
+  const state = (await call('state')).payload
+  assert.ok(state.blocked.count >= 1)
+  assert.ok(state.stats.byRoute.blocked.req >= 1, 'the report must say blocked, not direct')
+})
+
+await check('global: with fail-closed off, the same situation degrades to direct', async () => {
+  const { payload } = await call('config', { globalFailClosed: false })
+  assert.equal(payload.globalFailClosed, false)
+  assert.ok(lanIp !== undefined, 'no LAN address to observe the direct branch')
+  const answer = await through(proxyPort, `http://${lanIp}:${intranetPort}/degraded`)
+  assert.equal(answer.body, 'intranet-origin')
+  assert.ok((await call('state')).payload.fallback.count >= 1)
+})
+
+await check('config: an unusable upstream is rejected without replacing the stored one', async () => {
+  const before = (await call('state')).payload.upstream.configured
+  const { status, payload } = await call('config', { upstream: 'socks5://127.0.0.1:7890' })
+  assert.equal(status, 400)
+  assert.match(payload.error, /http:\/\/host:port/)
+  assert.equal((await call('state')).payload.upstream.configured, before)
 })
 
 await check('teardown: the policy is undone and the proxy stops listening', async () => {
