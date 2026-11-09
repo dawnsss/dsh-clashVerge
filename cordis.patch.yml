@@ -1,0 +1,13 @@
+# dsh-clash-verge bundle patch
+#
+# One row: the plugin's Node half. Installing the package through the profile
+#
+#   dsh plugin --profile web add D:\work\2026\ai\custom-plugin\dsh-clashVerge
+#
+# reconciles `dsh.profile.bundles` and merges this insert at boot, so no profile
+# file needs to be edited by hand. If the profile's own cordis.patch.yml already
+# carries a manual mount of this package, drop that line first — two rows mean
+# two Node halves, two local proxies and a duplicate route failure at boot.
+- insert:
+    - id: clash-verge
+      name: 'dsh-clash-verge'

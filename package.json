@@ -1,0 +1,50 @@
+{
+  "name": "dsh-clash-verge",
+  "version": "0.1.0",
+  "description": "Clash Verge 风格的出口模式面板：为 DSH 自身出网预制「不接管 / 直连 / 外网 / 全局」四种模式，经本地统计代理出网并出流量报表 · Egress mode presets and traffic report for DSH",
+  "license": "MIT",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dawnsss/dsh-clashVerge.git"
+  },
+  "homepage": "https://github.com/dawnsss/dsh-clashVerge#readme",
+  "bugs": {
+    "url": "https://github.com/dawnsss/dsh-clashVerge/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "clash",
+    "clash-verge",
+    "proxy",
+    "egress",
+    "traffic"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    },
+    "manifestVersion": 1
+  },
+  "files": [
+    "lib/*.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.15"
+  }
+}
