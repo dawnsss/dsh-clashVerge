@@ -342,12 +342,26 @@ await check('global: with fail-closed off, the same situation degrades to direct
   assert.ok((await call('state')).payload.fallback.count >= 1)
 })
 
+await check('config: a SOCKS5 upstream is accepted and reports its protocol', async () => {
+  const { status, payload } = await call('config', { upstream: 'socks5://alice:s3cret@127.0.0.1:1080' })
+  assert.equal(status, 200)
+  assert.equal(payload.upstream.protocol, 'socks5')
+  assert.equal(payload.upstream.tunnel, 'native')
+  assert.equal(payload.upstream.url, 'socks5://alice:***@127.0.0.1:1080', 'the password never reaches the panel')
+})
+
 await check('config: an unusable upstream is rejected without replacing the stored one', async () => {
   const before = (await call('state')).payload.upstream.configured
-  const { status, payload } = await call('config', { upstream: 'socks5://127.0.0.1:7890' })
+  const { status, payload } = await call('config', { upstream: 'socks4://127.0.0.1:7890' })
   assert.equal(status, 400)
-  assert.match(payload.error, /http:\/\/host:port/)
+  assert.match(payload.error, /socks5:\/\/host:port/)
   assert.equal((await call('state')).payload.upstream.configured, before)
+})
+
+await check('config: back to an HTTP upstream for the teardown checks', async () => {
+  const { status, payload } = await call('config', { upstream: `127.0.0.1:${upstreamPort}` })
+  assert.equal(status, 200)
+  assert.equal(payload.upstream.tunnel, 'http')
 })
 
 await check('teardown: the policy is undone and the proxy stops listening', async () => {

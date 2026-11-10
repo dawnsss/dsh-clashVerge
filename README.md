@@ -41,7 +41,7 @@ DSH 向外发的每一个请求，都从这条链路出去：`web_fetch`、`web_
 
 ```
 DSH 进程 ──fetch/子进程──▶ 127.0.0.1:<临时端口> 本地统计代理 ──┬─▶ 直连目标
-                                                              └─▶ 上游代理 ──▶ 节点
+                                                              └─▶ 上游（http / https / socks5 / socks5h / trojan）
 ```
 
 - 本地代理随插件启动，端口随机分配（只监听回环）。
@@ -51,7 +51,25 @@ DSH 进程 ──fetch/子进程──▶ 127.0.0.1:<临时端口> 本地统计�
 - 上游健康每 15 秒探测一次。不可达时按模式处理：`external` 降级直连（面板记「降级直连 N 次」），`global` 默认 **失败关闭** —— 请求不被发送、返回 502、报表记在 `blocked` 而不是 `direct`，可用 `globalFailClosed: false` 关掉改成降级。
 - 目标地址在建连前先校验：端口超出 1–65535 或主机名为空直接 400 拒绝，不会让一个畸形 `CONNECT` 把进程带走。
 
-上游地址默认自动探测：读到本机 `verge.yaml` 的 `verge_mixed_port` 就用它（常见 7897），读不到就用 7897；面板里可改成任意 `host:port` / `http(s)://host:port`。
+## 上游：可以是任何东西
+
+上游只是一个「下一个跳」，不绑定任何客户端。面板里填哪种都行，写进去就按那种协议说话：
+
+| 写法 | 协议 | 典型来源 |
+|---|---|---|
+| `127.0.0.1:7897` | HTTP 代理（省略 scheme 时按 http 处理） | 任何客户端的混合/HTTP 入站 |
+| `http://127.0.0.1:8080` | HTTP | tinyproxy、squid、企业代理 |
+| `https://proxy.example:8443` | HTTPS 代理（TLS 到代理本身） | 需要加密到代理那一段 |
+| `socks5://127.0.0.1:1080` | SOCKS5，**本机解析域名** | `ssh -N -D 1080 user@vps` |
+| `socks5h://127.0.0.1:1080` | SOCKS5，**对端解析域名** | 对端 DNS 更干净，或本机 DNS 被污染 |
+| `socks5://user:pass@host:1080` | SOCKS5 带用户名/口令 | 有认证的 SOCKS5 服务 |
+| `trojan://password@vps.example:443` | trojan（TLS） | 自建 trojan 监听 |
+
+所以不需要 Clash — 一条 `ssh -N -D 1080 you@your-vps` 就有 SOCKS5 上游了，面板里填 `socks5://127.0.0.1:1080` 即可，DSH 的出网从 VPS 出去，`global` 模式配合它做红队出口。trojan 想用自签证书就加 `?insecure=1`，证书按域名签、连接用 IP 时加 `?sni=your.domain`。
+
+上游地址留空时自动探测本机配置（读到 `verge.yaml` 的 `verge_mixed_port` 就用它，读不到用 7897）—— 这只是「让开箱即用的用户少填一次」，不是依赖：填了别的，自动探测就不参与。
+
+口令不会出现在面板和接口里：`state` 里的 url 渲染成 `socks5://user:***@host:1080`，密码只存在 `~/.dsh/storages/clash-verge/state.json`。
 
 ## 报表
 
@@ -120,21 +138,24 @@ dsh plugin --profile web add ./dsh-clashVerge
 
 ```bash
 node tests/smoke.mjs    # 代理路由、CONNECT 隧道、降级与计数
-node tests/host.mjs     # host 半契约：21 项（含鉴权、坏端口、失败关闭；需要本机装着 DSH，读它 profile 里的依赖）
+node tests/upstream.mjs # 上游协议：SOCKS5（无认证/带认证/被拒）、trojan 摘要头、隧道端到端
+node tests/host.mjs     # host 半契约：24 项（含鉴权、坏端口、失败关闭；需要本机装着 DSH，读它 profile 里的依赖）
 node tests/client.mjs   # bundle 契约；找不到含 react 的 profile 时自动跳过
 node tests/bench.mjs    # 回环性能取样，可选，默认 64 MiB × 3 轮
 ```
 
-`smoke` 与 `bench` 自己起 origin 与上游替身，不联网；`host` 会在 `~/.dsh/storages/clash-verge/` 下写状态文件，跑完自行清理。
+`smoke`、`upstream` 与 `bench` 自己起 origin 与上游替身（含一个带自签证书的假 trojan 监听），不联网；`host` 会在 `~/.dsh/storages/clash-verge/` 下写状态文件，跑完自行清理。
 
 ## 结构
 
 ```
 lib/index.js   host 半：模式、状态、上游探测、策略安装、HTTP 接口、egress_mode 工具
 lib/proxy.js   本地代理 + 计数器（无第三方依赖）
+lib/upstream.js  上游协议：http/https 的 CONNECT、socks5/socks5h 握手、trojan 摘要头
 lib/client.js  浏览器半：手写 bundle（__ModuleLoader__.load 外壳），侧栏图标 + 面板
 cordis.patch.yml  挂载行
 tests/smoke.mjs   代理路由与计数（自起 origin 与上游替身）
+tests/upstream.mjs 上游协议与隧道（假 SOCKS5 / 假 trojan / 端到端）
 tests/host.mjs    host 半契约：状态、模式、接口、工具、持久化、拆卸
 tests/client.mjs  bundle 契约：模块注册、槽位、图标与首屏渲染
 tests/bench.mjs   回环性能取样（小请求往返 / 批量吞吐 / CPU）
@@ -147,6 +168,7 @@ Host 半是原生 ESM JS，客户端半是手写 CJS bundle，因此**没有构�
 
 ## 注意
 
-- 只支持 HTTP/HTTPS 上游：填 `socks5://…` 会被 400 拒绝（`dsh-http-proxy` 也只懂 HTTP 上游），免得把一个不会工作的地址存进去。
+- 子进程的 `http_proxy` 环境变量只能写 HTTP 地址 —— 但那是**指向本插件的本地代理**，所以上游是 SOCKS5、trojan 都不影响子进程（`curl`、`git` 照样工作），协议转换在本地代理里完成。
+- 不支持的 scheme（`socks4://`、`vmess://` 等）在保存时被 400 拒绝，已经存着的配置不会被覆盖。
 - `external` 模式判定的是**主机名**，不做 DNS 解析后再判定 —— 一个公网域名解析到内网地址时仍会走上游，这是刻意的（否则每次请求都要多一次 DNS）。
 - 需要「连内网也走代理」时用 `global`，并把 `bypass` 留空。
