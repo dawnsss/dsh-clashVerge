@@ -222,7 +222,13 @@ async function startOrigin(body) {
     res.writeHead(200, { 'content-type': 'text/plain' })
     res.end(body)
   })
+  // An upgraded socket drops out of the server's connection list, so it has to be tracked and
+  // destroyed by hand or `close()` waits on it forever.
+  const upgraded = new Set()
   server.on('upgrade', (_req, socket) => {
+    upgraded.add(socket)
+    socket.on('close', () => upgraded.delete(socket))
+    socket.on('error', () => socket.destroy())
     socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: echo\r\nConnection: Upgrade\r\n\r\n')
     socket.on('data', chunk => socket.write(chunk))
   })
@@ -230,6 +236,8 @@ async function startOrigin(body) {
   return {
     port: server.address().port,
     close: () => new Promise((resolve) => {
+      for (const socket of upgraded) socket.destroy()
+      upgraded.clear()
       server.closeAllConnections?.()
       server.close(() => resolve(undefined))
     }),
@@ -319,6 +327,14 @@ await check('parseUpstream rejects what it cannot speak', () => {
   }
 })
 
+await check('parseUpstream refuses a trojan hop with no shared secret', () => {
+  // Trojan cannot report a bad secret — the header is fire-and-forget — so a secret-less descriptor
+  // would connect, greet, and tunnel nothing at all. It has to die at parse time.
+  assert.equal(parseUpstream('trojan://vps.example:443'), undefined)
+  assert.equal(parseUpstream('trojan://@vps.example:443'), undefined)
+  assert.notEqual(parseUpstream('trojan://secret@vps.example:443'), undefined)
+})
+
 await check('buildTrojanHeader writes digest, command and target', async () => {
   const digest = crypto.createHash('sha224').update('secret').digest('hex')
   assert.equal(digest.length, 56, 'sha224 renders as 56 hex characters')
@@ -343,9 +359,12 @@ const trojan = await startTrojan('hunter2')
 await check('SOCKS5: openTunnel reaches the target and carries bytes both ways', async () => {
   const socket = await openTunnel(parseUpstream(`socks5://127.0.0.1:${socksPlain.port}`), '127.0.0.1', origin.port)
   const answer = await new Promise((resolve, reject) => {
+    // openTunnel hands back a paused socket: the consumer resumes it, which is what pump() does in
+    // production via pipe().
     socket.write(`GET /hi HTTP/1.1\r\nHost: 127.0.0.1:${origin.port}\r\nConnection: close\r\n\r\n`)
     let text = ''
     socket.on('data', (chunk) => { text += chunk.toString('utf8') })
+    socket.resume()
     socket.on('close', () => resolve(text))
     socket.on('error', reject)
   })
@@ -393,6 +412,36 @@ await check('SOCKS5: a refused target is reported with the SOCKS5 reason', async
   }
 })
 
+await check('SOCKS5: bytes that arrive before the tunnel consumer attaches are kept', async () => {
+  // SSH, SMTP and MySQL all speak first. The handshake happens on the same socket the tunnel then
+  // uses, so anything the target sends in the gap belongs to the tunnel and must still be there.
+  const banner = 'SSH-2.0-dsh-clash-verge-test\r\n'
+  const sockets = new Set()
+  const server = net.createServer((client) => {
+    sockets.add(client)
+    client.on('error', () => {})
+    setTimeout(() => { if (!client.destroyed) client.write(banner) }, 30)
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const { port } = server.address()
+  const socket = await openTunnel(parseUpstream(`socks5://127.0.0.1:${socksPlain.port}`), '127.0.0.1', port)
+  try {
+    assert.equal(socket.isPaused(), true, 'the tunnel socket comes back paused, so nothing is emitted into the void')
+    // A real caller has a promise chain to walk before it attaches; reproduce that gap.
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    const first = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('the banner was dropped during the handshake gap')), 600)
+      socket.once('data', (chunk) => { clearTimeout(timer); resolve(chunk.toString('utf8')) })
+      socket.resume()
+    })
+    assert.equal(first, banner)
+  } finally {
+    socket.destroy()
+    for (const client of sockets) client.destroy()
+    await new Promise((resolve) => server.close(() => resolve(undefined)))
+  }
+})
+
 await check('trojan: openTunnel presents the digest and tunnels', async () => {
   const url = `trojan://hunter2@127.0.0.1:${trojan.port}?insecure=1`
   const socket = await openTunnel(parseUpstream(url), '127.0.0.1', origin.port)
@@ -402,6 +451,7 @@ await check('trojan: openTunnel presents the digest and tunnels', async () => {
     socket.on('data', (chunk) => { text += chunk.toString('utf8') })
     socket.on('close', () => resolve(text))
     socket.on('error', reject)
+    socket.resume()
   })
   socket.destroy()
   assert.match(answer, /through-the-tunnel/)
@@ -416,6 +466,74 @@ await check('proxy: absolute-form HTTP goes through a SOCKS5 upstream', async ()
     const snapshot = proxy.recorder.snapshot()
     assert.equal(snapshot.byRoute.upstream.req, 1, 'the request is reported as upstream traffic')
     assert.equal((snapshot.byRoute.direct ?? { req: 0 }).req, 0, 'nothing was reported as direct')
+  } finally {
+    await proxy.close()
+  }
+})
+
+/** Drive one HTTP upgrade through the proxy and echo a payload over the resulting socket. */
+function upgradeThrough(proxyPort, targetPort) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect({ host: '127.0.0.1', port: proxyPort }, () => {
+      socket.write(
+        `GET http://127.0.0.1:${targetPort}/ws HTTP/1.1\r\n`
+        + `Host: 127.0.0.1:${targetPort}\r\n`
+        + 'Connection: Upgrade\r\nUpgrade: echo\r\n\r\n',
+      )
+    })
+    let text = ''
+    let upgraded = false
+    const timer = setTimeout(() => {
+      socket.destroy()
+      reject(new Error(`no upgrade arrived, saw: ${JSON.stringify(text.slice(0, 200))}`))
+    }, 4000)
+    socket.on('data', (chunk) => {
+      const piece = chunk.toString('utf8')
+      text += piece
+      if (!upgraded && text.includes('\r\n\r\n')) {
+        upgraded = true
+        socket.write('ping-through-the-upgrade')
+      } else if (upgraded && text.includes('ping-through-the-upgrade')) {
+        clearTimeout(timer)
+        socket.destroy()
+        resolve(text)
+      }
+    })
+    socket.on('error', (error) => { clearTimeout(timer); reject(error) })
+    socket.on('close', () => { clearTimeout(timer); if (!upgraded) reject(new Error('closed before the upgrade')) })
+  })
+}
+
+await check('proxy: an HTTP upgrade is carried when the hop is direct', async () => {
+  const proxy = await startProxy(`socks5://127.0.0.1:${socksPlain.port}`)
+  const directProxy = createProxyServer({
+    recorder: createRecorder(),
+    route: () => 'direct',
+    mode: () => 'direct',
+    upstream: () => undefined,
+    onUpstreamFailure: () => {},
+    log: () => {},
+  })
+  await new Promise((resolve) => directProxy.listen(0, '127.0.0.1', resolve))
+  try {
+    const answer = await upgradeThrough(directProxy.address().port, origin.port)
+    assert.match(answer, /101/)
+    assert.match(answer, /ping-through-the-upgrade/)
+  } finally {
+    directProxy.closeAllConnections?.()
+    await new Promise((resolve) => directProxy.close(() => resolve(undefined)))
+    await proxy.close()
+  }
+})
+
+await check('proxy: an HTTP upgrade is tunnelled through a SOCKS5 upstream', async () => {
+  const before = socksPlain.seen.length
+  const proxy = await startProxy(`socks5://127.0.0.1:${socksPlain.port}`)
+  try {
+    const answer = await upgradeThrough(proxy.port, origin.port)
+    assert.match(answer, /101/)
+    assert.match(answer, /ping-through-the-upgrade/)
+    assert.equal(socksPlain.seen.length, before + 1, 'the upgrade target reached the SOCKS5 server')
   } finally {
     await proxy.close()
   }

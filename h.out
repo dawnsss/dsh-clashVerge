@@ -1,0 +1,25 @@
+ok    state: untouched start
+ok    mode: unknown preset is rejected
+ok    mode: direct keeps loopback direct and counts it
+ok    config: upstream is adopted and probed
+ok    external: a public host rides the upstream
+ok    external: a private host never reaches the upstream
+ok    global + bypass: the bypass list wins over the preset
+ok    global: everything else rides the upstream and is reported
+ok    config: bypass is cleared before the next preset
+ok    tool: egress_mode switches and reports
+ok    state: the chosen mode is persisted
+ok    reset: counters drop to zero
+ok    probe: reports the upstream again
+ok    api: a cross-site POST cannot change the mode
+ok    api: a same-origin POST with a wrong token is refused
+ok    api: a POST with a non-JSON content type is refused
+ok    proxy: an impossible CONNECT port is refused, and the process survives it
+ok    global: an unreachable upstream fails closed instead of going direct
+ok    global: with fail-closed off, the same situation degrades to direct
+ok    config: a SOCKS5 upstream is accepted and reports its protocol
+ok    config: an unusable upstream is rejected without replacing the stored one
+ok    config: back to an HTTP upstream for the teardown checks
+ok    teardown: the policy is undone and the proxy stops listening
+formatBytes: 1.50 KB / 5.00 MB
+host: ok
