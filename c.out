@@ -1,5 +1,0 @@
-ok    bundle contract
-ok    slot registrations: main + sidebar.panellist
-ok    icon renders
-ok    panel renders before its first poll
-client: ok
