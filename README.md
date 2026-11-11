@@ -71,6 +71,18 @@ DSH 进程 ──fetch/子进程──▶ 127.0.0.1:<临时端口> 本地统计�
 
 口令不会出现在面板和接口里：`state` 里的 url 渲染成 `socks5://user:***@host:1080`，密码只存在 `~/.dsh/storages/clash-verge/state.json`。
 
+## 订阅（可选）
+
+不想一条条填上游，就把订阅地址丢进面板：
+
+- 三种格式都读：**Clash 配置**（`proxies:` 块、行内映射、单行列表）、**base64** 包、**一行一个 URI**（`#` 后面是名字）。
+- 拉取时先直连，不通再经本机代理重试 —— 这条路径本身绕开进程级策略，否则「要连订阅得先有订阅」就死循环了。
+- 每个节点会单独探活（TCP 连接，2s 超时），面板显示延迟与在线状态；`selected: "auto"` 时用**最快且在线**的那个，60 秒重测一次。没探到过延迟的节点不会被 `auto` 选中 —— 猜一个可能把第一条请进黑洞。
+- 读不了的节点不装作读得了：`ss`/`vmess`/`vless`/`hysteria`/`tuic` 等会进 `skipped` 并写原因，面板底下直接列出来。
+- 节点只有一个「下一个跳」的含义：`type` 与 URL 一一对应，选中哪个就等于把上游换成它；手动上游（面板第一行）随时可以切回去。
+
+节点和订阅地址存在 `state.json` 里，重启后还在；延迟不存 —— 延迟是某一刻的事，不是配置。
+
 ## 报表
 
 - 实时上行/下行速率（最近 5 个完整秒桶的均值）
@@ -110,6 +122,9 @@ DSH 进程 ──fetch/子进程──▶ 127.0.0.1:<临时端口> 本地统计�
 | GET | `/state` | 当前模式、上游、代理状态、完整报表 |
 | POST | `/mode` | `{ "mode": "off" \| "direct" \| "external" \| "global" }` |
 | POST | `/config` | `{ upstream?, bypass?, intranetSuffixes?, globalFailClosed? }`（`upstream` 非法值返回 400 且不覆盖已存配置） |
+| POST | `/subscription` | `{ "url": "https://…/sub" }` 拉取并替换节点列表；`url` 为空则清空 |
+| POST | `/node` | `{ "id": "" \| "auto" \| <node id> }` 选节点（空串 = 用配置的上游） |
+| POST | `/nodes/probe` | 给所有节点重新测速 |
 | POST | `/probe` | 立即探测上游 |
 | POST | `/reset` | 清零统计 |
 
@@ -139,7 +154,8 @@ dsh plugin --profile web add ./dsh-clashVerge
 ```bash
 node tests/smoke.mjs    # 代理路由、CONNECT 隧道、降级与计数
 node tests/upstream.mjs # 上游协议：SOCKS5（无认证/带认证/被拒）、trojan 摘要头、隧道端到端
-node tests/host.mjs     # host 半契约：24 项（含鉴权、坏端口、失败关闭；需要本机装着 DSH，读它 profile 里的依赖）
+node tests/subscription.mjs # 订阅：Clash 块/行内/单行、base64、URI 列表、拉取重定向与上限
+node tests/host.mjs     # host 半契约：29 项（含鉴权、坏端口、失败关闭、订阅与选节点；需要本机装着 DSH，读它 profile 里的依赖）
 node tests/client.mjs   # bundle 契约；找不到含 react 的 profile 时自动跳过
 node tests/bench.mjs    # 回环性能取样，可选，默认 64 MiB × 3 轮
 ```
@@ -152,10 +168,12 @@ node tests/bench.mjs    # 回环性能取样，可选，默认 64 MiB × 3 轮
 lib/index.js   host 半：模式、状态、上游探测、策略安装、HTTP 接口、egress_mode 工具
 lib/proxy.js   本地代理 + 计数器（无第三方依赖）
 lib/upstream.js  上游协议：http/https 的 CONNECT、socks5/socks5h 握手、trojan 摘要头
+lib/subscription.js 订阅：Clash 配置 / base64 / URI 列表解析，以及绕开进程策略的拉取
 lib/client.js  浏览器半：手写 bundle（__ModuleLoader__.load 外壳），侧栏图标 + 面板
 cordis.patch.yml  挂载行
 tests/smoke.mjs   代理路由与计数（自起 origin 与上游替身）
 tests/upstream.mjs 上游协议与隧道（假 SOCKS5 / 假 trojan / 端到端）
+tests/subscription.mjs 订阅解析与拉取（本地 server、重定向、上限、代理回退）
 tests/host.mjs    host 半契约：状态、模式、接口、工具、持久化、拆卸
 tests/client.mjs  bundle 契约：模块注册、槽位、图标与首屏渲染
 tests/bench.mjs   回环性能取样（小请求往返 / 批量吞吐 / CPU）

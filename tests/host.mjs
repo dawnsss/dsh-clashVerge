@@ -364,6 +364,90 @@ await check('config: back to an HTTP upstream for the teardown checks', async ()
   assert.equal(payload.upstream.tunnel, 'http')
 })
 
+// A subscription server: one live hop (the fake upstream above) and one dead one, so 'auto' has to
+// pick, and picking has to be observable.
+const subscriptionBody = [
+  'proxies:',
+  '  - name: dead trojan',
+  '    type: trojan',
+  '    server: 127.0.0.1',
+  '    port: 9',
+  '    password: pw',
+  `  - name: live http`,
+  '    type: http',
+  '    server: 127.0.0.1',
+  `    port: ${upstreamPort}`,
+  '  - name: an ss node',
+  '    type: ss',
+  '    server: 127.0.0.1',
+  '    port: 8388',
+  '    cipher: aes-256-gcm',
+  '    password: hunter2',
+].join('\n')
+const subscription = http.createServer((_req, res) => {
+  res.writeHead(200, { 'content-type': 'text/yaml' })
+  res.end(subscriptionBody)
+})
+const subscriptionPort = await listen(subscription)
+
+await check('subscription: a Clash document becomes nodes, and the dead one is counted', async () => {
+  const { status, payload } = await call('subscription', { url: `http://127.0.0.1:${subscriptionPort}/sub` })
+  assert.equal(status, 200, payload.error)
+  assert.equal(payload.nodes.length, 2)
+  assert.deepEqual(payload.nodes.map(node => node.name), ['dead trojan', 'live http'])
+  assert.equal(payload.subscription.count, 2)
+  assert.equal(payload.subscription.skipped.length, 1)
+  assert.match(payload.subscription.skipped[0].reason, /shadowsocks is not implemented/)
+  assert.equal(payload.upstream.source, 'node', 'a freshly pulled subscription starts selecting')
+})
+
+await check('subscription: every node was probed, and only the live one answers', async () => {
+  const { payload } = await call('nodes/probe', {})
+  const byName = Object.fromEntries(payload.nodes.map(node => [node.name, node]))
+  assert.equal(byName['live http'].ok, true)
+  assert.equal(byName['dead trojan'].ok, false)
+  assert.match(byName['dead trojan'].error, /ECONNREFUSED|refused/)
+  assert.equal(byName['live http'].latencyMs >= 0, true)
+  assert.ok(byName['live http'].checkedAt > 0)
+})
+
+await check('subscription: auto picks the live hop and the traffic follows it', async () => {
+  const { payload } = await call('node', { id: 'auto' })
+  assert.equal(payload.selected, 'auto')
+  assert.equal(payload.upstream.url, `http://127.0.0.1:${upstreamPort}`)
+  const before = upstreamSeen.length
+  const answer = await through(proxyPort, 'http://public.example/after-node')
+  assert.equal(answer.body, 'via-clash')
+  assert.ok(upstreamSeen.length > before)
+})
+
+await check('node: an unknown id is refused, and the manual route can be restored', async () => {
+  const rejected = await call('node', { id: 'nope' })
+  assert.equal(rejected.status, 400)
+  assert.match(rejected.payload.error, /unknown node/)
+  const manual = await call('node', { id: '' })
+  assert.equal(manual.status, 200)
+  assert.equal(manual.payload.selected, '')
+  assert.equal(manual.payload.upstream.source, 'configured', 'the manual value is back in force')
+})
+
+await check('subscription: clearing the url drops the nodes', async () => {
+  const { status, payload } = await call('subscription', { url: '' })
+  assert.equal(status, 200)
+  assert.equal(payload.nodes.length, 0)
+  assert.equal(payload.selected, '')
+  assert.equal(payload.subscription.url, '')
+  assert.equal(payload.upstream.source, 'configured')
+})
+
+await check('subscription: an unreadable url is reported without wiping the current nodes', async () => {
+  await call('subscription', { url: `http://127.0.0.1:${subscriptionPort}/sub` })
+  const { status, payload } = await call('subscription', { url: 'http://127.0.0.1:9/sub' })
+  assert.equal(status, 502, 'a dead subscription host is a bad gateway, not a bad request')
+  assert.match(payload.error, /cannot read the subscription/)
+  assert.equal((await call('state')).payload.nodes.length, 2, 'the previous list survives a failed refresh')
+})
+
 await check('teardown: the policy is undone and the proxy stops listening', async () => {
   for (const dispose of disposers) if (typeof dispose === 'function') await dispose()
   await new Promise((resolve) => setTimeout(resolve, 250))
@@ -377,7 +461,7 @@ await check('teardown: the policy is undone and the proxy stops listening', asyn
   assert.equal(refused, true)
 })
 
-for (const server of [bridge, upstream, origin, intranet]) {
+for (const server of [bridge, upstream, origin, intranet, subscription]) {
   server.closeAllConnections?.()
   await new Promise((resolve) => server.close(resolve))
 }
